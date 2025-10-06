@@ -11,7 +11,7 @@ from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, P
 import re
 
 # ===== CONFIGURATION =====
-BOT_TOKEN = "8440425262:AAEXO7zBqDcizTE6QDJyqQy5gnZjZHmxp0k"
+BOT_TOKEN = "8219403225:AAHkHN3RvAc8Xx3ZWYbFef7K8dmMtOzMW1M"
 API_ID = 24990959
 API_HASH = "686baf9f2da85c2bac5b420848e648bf"
 DB_NAME = "aftab_bot.db"
