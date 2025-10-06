@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 import asyncio
+import imghdr_py as imghdr
 import os
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
