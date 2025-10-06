@@ -891,27 +891,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== MAIN FUNCTION =====
 def main():
     """Start the bot"""
+    # Initialize database
     init_database()
     
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("🤖 AFTAB BOT - FIXED OTP ISSUES")
-    print("✅ Auto code resend")
-    print("✅ Better IP handling") 
-    print("✅ 5-minute code validity")
-    print("🚀 Starting...")
-    
     try:
-        application.run_polling()
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped")
-    finally:
-        # Cleanup
-        asyncio.run(cleanup_user_session)
+        # Create application with error handling
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # Add handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CallbackQueryHandler(button_handler))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        print("🤖 AFTAB BOT - COMPATIBLE VERSION")
+        print("✅ Fixed version compatibility")
+        print("✅ Working with latest python-telegram-bot")
+        print("✅ Ready for Render deployment")
+        print("🚀 Starting bot...")
+        
+        # Start polling
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            timeout=30,
+            pool_timeout=30
+        )
+        
+    except Exception as e:
+        print(f"❌ Error starting bot: {e}")
+        print("Please check your BOT_TOKEN and try again.")
 
 if __name__ == "__main__":
     main()
