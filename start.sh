@@ -1,2 +1,2 @@
 #!/bin/bash
-python3.10 main.py
+python main.py
