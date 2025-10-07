@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Ad Broadcasting Bot - Webhook Version for Render
+Ad Broadcasting Bot - Render Compatible Version
 Phone Number + OTP Authentication
+Python 3.12.1 Compatible
 """
 
 import os
@@ -60,24 +61,9 @@ def home():
 def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Webhook endpoint for Telegram"""
-    try:
-        # Process webhook update
-        update = Update.de_json(request.get_json(), bot_application.bot)
-        asyncio.run_coroutine_threadsafe(
-            bot_application.process_update(update),
-            bot_application._get_running_loop()
-        )
-        return 'ok'
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return 'error', 500
-
 def run_flask():
     """Run Flask server"""
-    app.run(host="0.0.0.0", port=10000, debug=False)
+    app.run(host="0.0.0.0", port=10000, debug=False, use_reloader=False)
 
 # ---------------- DATABASE SETUP ----------------
 def init_database():
@@ -484,27 +470,6 @@ broadcaster = AdBroadcaster()
 user_states = {}
 ad_temp_data = {}
 user_otp_data = {}
-
-# ---------------- BOT APPLICATION SETUP ----------------
-def setup_bot_application():
-    """Setup and return the bot application"""
-    application = Application.builder().token(AD_BOT_TOKEN).build()
-    
-    # Register handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_media_message))
-    application.add_handler(MessageHandler(filters.VIDEO, handle_media_message))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_caption_message, block=False))
-    application.add_error_handler(error_handler)
-    
-    return application
-
-# Initialize bot application
-bot_application = setup_bot_application()
 
 # ---------------- KEYBOARD GENERATORS ----------------
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -1217,36 +1182,40 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ---------------- BOT POLLING FUNCTION ----------------
-async def run_bot_polling():
-    """Run bot in polling mode"""
+# ---------------- BOT SETUP AND POLLING ----------------
+async def run_bot():
+    """Run the Telegram bot"""
     print("🤖 Starting Ad Broadcasting Bot...")
     print(f"📁 Data Directory: {BASE_DIR}")
     print(f"💾 Database: {DB_PATH}")
     print(f"⏰ Broadcast Interval: {BROADCAST_INTERVAL} seconds")
     print("🔐 Authentication: Phone Number + OTP (No API required)")
     print("🌍 Works in ALL countries")
-    print("🚀 Bot is running in polling mode...")
     
-    try:
-        await bot_application.initialize()
-        await bot_application.start()
-        await bot_application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-        
-        # Keep the bot running
-        while True:
-            await asyncio.sleep(3600)  # Sleep for 1 hour
-            
-    except Exception as e:
-        logger.error(f"Bot polling error: {e}")
-    finally:
-        await bot_application.stop()
+    # Create application
+    application = Application.builder().token(AD_BOT_TOKEN).build()
+    
+    # Register handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_media_message))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_media_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_caption_message, block=False))
+    application.add_error_handler(error_handler)
+    
+    print("🚀 Bot is starting polling...")
+    
+    # Start polling
+    await application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
-# ---------------- MAIN FUNCTION ----------------
-async def main():
+# ---------------- MAIN EXECUTION ----------------
+def main():
     """Main function to run both Flask and bot"""
     print("🚀 Starting Ad Broadcasting Bot on Render...")
     
@@ -1255,10 +1224,8 @@ async def main():
     flask_thread.start()
     print("🌐 Flask server started on port 10000")
     
-    # Run bot polling
-    await run_bot_polling()
+    # Run bot in main thread
+    asyncio.run(run_bot())
 
-# Run both Flask + bot
 if __name__ == "__main__":
-    # Start the application
-    asyncio.run(main())
+    main()
