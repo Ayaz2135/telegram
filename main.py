@@ -1,924 +1,1264 @@
-import logging
-import sqlite3
-import asyncio
+#!/usr/bin/env python3
+"""
+Ad Broadcasting Bot - Webhook Version for Render
+Phone Number + OTP Authentication
+"""
+
 import os
+import json
+import asyncio
+import time
+import sqlite3
+import random
+import hashlib
+import threading
 from datetime import datetime, timedelta
+from typing import Optional, Dict, List
+import logging
+from flask import Flask, request
+
+# Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneNumberInvalidError, FloodWaitError, PhoneCodeExpiredError
-import re
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, CallbackQueryHandler
+)
 
-# ===== CONFIGURATION =====
-BOT_TOKEN = "8219403225:AAHkHN3RvAc8Xx3ZWYbFef7K8dmMtOzMW1M"
-API_ID = 24990959
-API_HASH = "686baf9f2da85c2bac5b420848e648bf"
-DB_NAME = "aftab_bot.db"
-ADMIN_USERNAME = "azttech"
+# ---------------- CONFIG ----------------
+AD_BOT_TOKEN = "7398078402:AAGXTBxjuLt1q-4vhxKI0SbC3kmq2jQIFwY"
 
-# Enable logging
+# Ad broadcasting settings
+BROADCAST_INTERVAL = 120  # 120 seconds between cycles
+
+# OTP settings
+OTP_EXPIRY_MINUTES = 10
+OTP_LENGTH = 6
+
+# Database and storage paths
+BASE_DIR = os.path.join(os.getcwd(), "ad_bot_data")
+DB_PATH = os.path.join(BASE_DIR, "users.db")
+ADS_DIR = os.path.join(BASE_DIR, "ads")
+
+os.makedirs(BASE_DIR, exist_ok=True)
+os.makedirs(ADS_DIR, exist_ok=True)
+
+# Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Global variables
-user_sessions = {}
-broadcast_tasks = {}
+# Initialize Flask app
+app = Flask(__name__)
 
-# ===== DATABASE FUNCTIONS =====
+@app.route('/')
+def home():
+    return "🤖 Ad Broadcasting Bot is running successfully on Render! 🚀"
+
+@app.route('/health')
+def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Webhook endpoint for Telegram"""
+    try:
+        # Process webhook update
+        update = Update.de_json(request.get_json(), bot_application.bot)
+        asyncio.run_coroutine_threadsafe(
+            bot_application.process_update(update),
+            bot_application._get_running_loop()
+        )
+        return 'ok'
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'error', 500
+
+def run_flask():
+    """Run Flask server"""
+    app.run(host="0.0.0.0", port=10000, debug=False)
+
+# ---------------- DATABASE SETUP ----------------
 def init_database():
-    """Initialize the SQLite database"""
-    conn = sqlite3.connect(DB_NAME)
+    """Initialize SQLite database"""
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Users table
+    # Users table with phone authentication
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Accounts table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS accounts (
-            account_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            phone_number TEXT,
-            session_string TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE,
+            phone_number TEXT UNIQUE,
             is_active BOOLEAN DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
+            last_login TIMESTAMP
         )
     ''')
     
-    # Settings table
+    # OTP table for authentication
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS settings (
-            user_id INTEGER PRIMARY KEY,
-            ad_message TEXT DEFAULT 'Welcome to our service! 🚀',
-            cycle_interval INTEGER DEFAULT 120,
+        CREATE TABLE IF NOT EXISTS otps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone_number TEXT,
+            otp_code TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_used BOOLEAN DEFAULT 0
+        )
+    ''')
+    
+    # Ads table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            ad_type TEXT,
+            message_text TEXT,
+            media_file TEXT,
+            is_active BOOLEAN DEFAULT 1,
             is_broadcasting BOOLEAN DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (user_id)
         )
     ''')
     
-    # Groups table
+    # Groups table - users manually add groups
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS groups (
-            group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            account_id INTEGER,
-            group_name TEXT,
-            group_username TEXT,
-            group_id_num INTEGER,
-            member_count INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id),
-            FOREIGN KEY (account_id) REFERENCES accounts (account_id)
-        )
-    ''')
-    
-    # Analytics table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS analytics (
-            analytic_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            messages_sent INTEGER DEFAULT 0,
-            groups_reached INTEGER DEFAULT 0,
-            date DATE DEFAULT CURRENT_DATE,
+            group_id TEXT,
+            group_title TEXT,
+            is_active BOOLEAN DEFAULT 1,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (user_id)
         )
     ''')
     
     conn.commit()
     conn.close()
-    print("✅ Database initialized successfully")
 
-def get_user(user_id):
-    """Get user from database"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
+# Initialize database
+init_database()
 
-def create_user(user_id, username, first_name, last_name):
-    """Create new user in database"""
-    conn = sqlite3.connect(DB_NAME)
+# ---------------- DATABASE FUNCTIONS ----------------
+def get_db_connection():
+    return sqlite3.connect(DB_PATH)
+
+def add_user(user_id: int, phone_number: str):
+    """Add or update user in database"""
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR IGNORE INTO users (user_id, username, first_name, last_name) 
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, username, first_name, last_name))
     
-    # Create default settings
     cursor.execute('''
-        INSERT OR IGNORE INTO settings (user_id) VALUES (?)
-    ''', (user_id,))
-    
-    conn.commit()
-    conn.close()
-
-def get_user_settings(user_id):
-    """Get user settings"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM settings WHERE user_id = ?', (user_id,))
-    settings = cursor.fetchone()
-    conn.close()
-    return settings
-
-def update_ad_message(user_id, message):
-    """Update ad message"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE settings SET ad_message = ? WHERE user_id = ?', (message, user_id))
-    conn.commit()
-    conn.close()
-
-def update_interval(user_id, interval):
-    """Update cycle interval"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE settings SET cycle_interval = ? WHERE user_id = ?', (interval, user_id))
-    conn.commit()
-    conn.close()
-
-def update_broadcast_status(user_id, status):
-    """Update broadcast status"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE settings SET is_broadcasting = ? WHERE user_id = ?', (status, user_id))
-    conn.commit()
-    conn.close()
-
-def get_accounts_count(user_id):
-    """Get number of accounts for user"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM accounts WHERE user_id = ? AND is_active = 1', (user_id,))
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count
-
-def get_user_accounts(user_id):
-    """Get all accounts for user"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM accounts WHERE user_id = ? AND is_active = 1', (user_id,))
-    accounts = cursor.fetchall()
-    conn.close()
-    return accounts
-
-def add_account(user_id, phone_number, session_string):
-    """Add new account with session string"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO accounts (user_id, phone_number, session_string) 
+        INSERT OR REPLACE INTO users (user_id, phone_number, last_login)
         VALUES (?, ?, ?)
-    ''', (user_id, phone_number, session_string))
+    ''', (user_id, phone_number, datetime.now()))
+    
     conn.commit()
     conn.close()
 
-def get_groups_count(user_id):
-    """Get number of groups for user"""
-    conn = sqlite3.connect(DB_NAME)
+def get_user(user_id: int) -> Optional[dict]:
+    """Get user from database"""
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM groups WHERE user_id = ?', (user_id,))
-    count = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
     conn.close()
-    return count
+    
+    if row:
+        return {
+            'id': row[0],
+            'user_id': row[1],
+            'phone_number': row[2],
+            'is_active': bool(row[3]),
+            'created_at': row[4],
+            'last_login': row[5]
+        }
+    return None
 
-def get_user_groups(user_id):
-    """Get all groups for user"""
-    conn = sqlite3.connect(DB_NAME)
+# ---------------- OTP MANAGEMENT ----------------
+def generate_otp() -> str:
+    """Generate a random OTP code"""
+    return ''.join([str(random.randint(0, 9)) for _ in range(OTP_LENGTH)])
+
+def save_otp(phone_number: str, otp_code: str):
+    """Save OTP to database"""
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT * FROM groups WHERE user_id = ?', (user_id,))
-    groups = cursor.fetchall()
+    
+    # Clear old OTPs for this phone number
+    cursor.execute('DELETE FROM otps WHERE phone_number = ?', (phone_number,))
+    
+    # Save new OTP
+    cursor.execute('''
+        INSERT INTO otps (phone_number, otp_code)
+        VALUES (?, ?)
+    ''', (phone_number, otp_code))
+    
+    conn.commit()
+    conn.close()
+
+def verify_otp(phone_number: str, otp_code: str) -> bool:
+    """Verify OTP code"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT * FROM otps 
+        WHERE phone_number = ? AND otp_code = ? AND is_used = 0
+        AND created_at > datetime('now', ?)
+    ''', (phone_number, otp_code, f'-{OTP_EXPIRY_MINUTES} minutes'))
+    
+    row = cursor.fetchone()
+    
+    if row:
+        # Mark OTP as used
+        cursor.execute('UPDATE otps SET is_used = 1 WHERE id = ?', (row[0],))
+        conn.commit()
+        conn.close()
+        return True
+    
+    conn.close()
+    return False
+
+# ---------------- AD MANAGEMENT ----------------
+def save_ad(user_id: int, ad_type: str, message_text: str, media_file: str = None):
+    """Save ad to database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO ads (user_id, ad_type, message_text, media_file)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, ad_type, message_text, media_file))
+    
+    ad_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return ad_id
+
+def get_user_ads(user_id: int) -> List[dict]:
+    """Get all ads for a user"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM ads WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+    
+    ads = []
+    for row in cursor.fetchall():
+        ads.append({
+            'id': row[0],
+            'user_id': row[1],
+            'ad_type': row[2],
+            'message_text': row[3],
+            'media_file': row[4],
+            'is_active': bool(row[5]),
+            'is_broadcasting': bool(row[6]),
+            'created_at': row[7]
+        })
+    conn.close()
+    return ads
+
+def set_ad_broadcasting(ad_id: int, broadcasting: bool):
+    """Set ad broadcasting status"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('UPDATE ads SET is_broadcasting = ? WHERE id = ?', (1 if broadcasting else 0, ad_id))
+    conn.commit()
+    conn.close()
+
+# ---------------- GROUP MANAGEMENT ----------------
+def save_group(user_id: int, group_id: str, group_title: str):
+    """Save group to database"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check if group exists
+    cursor.execute('SELECT id FROM groups WHERE user_id = ? AND group_id = ?', (user_id, group_id))
+    if not cursor.fetchone():
+        cursor.execute('''
+            INSERT INTO groups (user_id, group_id, group_title)
+            VALUES (?, ?, ?)
+        ''', (user_id, group_id, group_title))
+    
+    conn.commit()
+    conn.close()
+
+def get_user_groups(user_id: int) -> List[dict]:
+    """Get all groups for a user"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM groups WHERE user_id = ? AND is_active = 1', (user_id,))
+    
+    groups = []
+    for row in cursor.fetchall():
+        groups.append({
+            'id': row[0],
+            'user_id': row[1],
+            'group_id': row[2],
+            'group_title': row[3],
+            'is_active': bool(row[4]),
+            'added_at': row[5]
+        })
     conn.close()
     return groups
 
-def add_group(user_id, account_id, group_name, group_username, group_id_num, member_count):
-    """Add group to database"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR IGNORE INTO groups (user_id, account_id, group_name, group_username, group_id_num, member_count)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (user_id, account_id, group_name, group_username, group_id_num, member_count))
-    conn.commit()
-    conn.close()
-
-def get_analytics(user_id):
-    """Get user analytics"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT SUM(messages_sent), SUM(groups_reached) 
-        FROM analytics WHERE user_id = ?
-    ''', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result or (0, 0)
-
-def update_analytics(user_id, messages_sent, groups_reached):
-    """Update analytics"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO analytics (user_id, messages_sent, groups_reached)
-        VALUES (?, ?, ?)
-    ''', (user_id, messages_sent, groups_reached))
-    conn.commit()
-    conn.close()
-
-# ===== TELEGRAM CLIENT FUNCTIONS =====
-async def create_telegram_client():
-    """Create Telegram client with proper configuration"""
-    return TelegramClient(
-        StringSession(),
-        API_ID,
-        API_HASH,
-        device_model="Samsung Galaxy S21",
-        system_version="Android 12",
-        app_version="8.7.2",
-        lang_code="en",
-        system_lang_code="en-US"
-    )
-
-async def send_otp_code(phone_number, user_id, update: Update):
-    """Send OTP code request and handle verification"""
-    try:
-        # Clean up any existing session
-        await cleanup_user_session(user_id)
-
-        # Create new client instance
-        client = await create_telegram_client()
-        await client.connect()
-
-        # Check if already authorized
-        if await client.is_user_authorized():
-            await update.message.reply_text(
-                "❌ This phone number is already authorized in another session.\n\n"
-                "Please use a different phone number."
-            )
-            await client.disconnect()
-            return False
-
-        # Send code request
+# ---------------- AD BROADCASTING SYSTEM ----------------
+class AdBroadcaster:
+    def __init__(self):
+        self.broadcasting_tasks = {}
+    
+    async def start_broadcasting(self, user_id: int, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Start broadcasting ad to all groups"""
         try:
-            sent_code = await client.send_code_request(phone_number)
-            logger.info(f"OTP sent to {phone_number}")
-        except PhoneNumberInvalidError:
-            await update.message.reply_text(
-                "❌ Invalid phone number format.\n\n"
-                "Please use format: +1234567890"
-            )
-            await client.disconnect()
-            return False
-        except FloodWaitError as e:
-            wait_time = e.seconds
-            await update.message.reply_text(
-                f"❌ Too many attempts. Please wait {wait_time} seconds."
-            )
-            await client.disconnect()
-            return False
-        except Exception as e:
-            error_msg = str(e)
-            await update.message.reply_text(
-                f"❌ Error: {error_msg}\n\n"
-                "Please try again or contact admin."
-            )
-            await client.disconnect()
-            return False
-
-        # Store session data
-        user_sessions[user_id] = {
-            "type": "awaiting_code",
-            "phone": phone_number,
-            "client": client,
-            "sent_code": sent_code,
-            "attempts": 0,
-            "created_at": datetime.now(),
-            "phone_code_hash": sent_code.phone_code_hash
-        }
-
-        await update.message.reply_text(
-            f"✅ Code sent to {phone_number}\n\n"
-            f"📱 Enter the 5-digit code:\n\n"
-            f"⏰ Code valid for 5 minutes\n"
-            f"🔄 Send 'resend' for new code\n"
-            f"❌ Send 'cancel' to stop\n\n"
-            f"Example: 12345"
-        )
-
-        return True
-
-    except Exception as e:
-        logger.error(f"Error in send_otp_code: {e}")
-        await update.message.reply_text(
-            "❌ Connection error. Please try again."
-        )
-        return False
-
-async def resend_otp_code(user_id, update: Update):
-    """Resend OTP code with new client instance"""
-    try:
-        if user_id not in user_sessions:
-            await update.message.reply_text("❌ Session expired. Start over with /start")
-            return False
-
-        session_data = user_sessions[user_id]
-        phone = session_data["phone"]
-        
-        # Create completely new client for resend
-        await cleanup_user_session(user_id)
-        
-        client = await create_telegram_client()
-        await client.connect()
-
-        # Resend code
-        try:
-            sent_code = await client.send_code_request(phone)
-            logger.info(f"OTP resent to {phone}")
-        except Exception as e:
-            await update.message.reply_text(
-                f"❌ Error resending: {str(e)}"
-            )
-            await client.disconnect()
-            return False
-
-        # Update session data with new client
-        user_sessions[user_id] = {
-            "type": "awaiting_code",
-            "phone": phone,
-            "client": client,
-            "sent_code": sent_code,
-            "attempts": 0,
-            "created_at": datetime.now(),
-            "phone_code_hash": sent_code.phone_code_hash
-        }
-
-        await update.message.reply_text(
-            f"✅ New code sent to {phone}\n\n"
-            f"📱 Enter the new 5-digit code:\n\n"
-            f"⏰ Code valid for 5 minutes\n"
-            f"Example: 12345"
-        )
-
-        return True
-
-    except Exception as e:
-        logger.error(f"Error resending OTP: {e}")
-        await update.message.reply_text(
-            "❌ Error resending code. Start over with /start"
-        )
-        return False
-
-async def verify_otp_code(user_id, code, update: Update):
-    """Verify OTP code and create session"""
-    try:
-        if user_id not in user_sessions:
-            await update.message.reply_text("❌ Session expired. Start over with /start")
-            return False
-
-        session_data = user_sessions[user_id]
-        client = session_data["client"]
-        phone = session_data["phone"]
-        phone_code_hash = session_data["phone_code_hash"]
-
-        # Check if code expired (5 minutes)
-        if datetime.now() - session_data["created_at"] > timedelta(minutes=5):
-            await update.message.reply_text(
-                "❌ Code expired! Getting new code...\n\n"
-                "Please wait..."
-            )
-            # Auto-resend instead of asking user
-            success = await resend_otp_code(user_id, update)
-            return False
-
-        # Increment attempts
-        user_sessions[user_id]["attempts"] += 1
-
-        # Verify the code
-        try:
-            result = await client.sign_in(
-                phone=phone,
-                code=code,
-                phone_code_hash=phone_code_hash
+            user = get_user(user_id)
+            if not user:
+                await context.bot.send_message(user_id, "❌ User not found. Please login first.")
+                return False
+            
+            ads = get_user_ads(user_id)
+            ad = next((a for a in ads if a['id'] == ad_id), None)
+            if not ad:
+                await context.bot.send_message(user_id, "❌ Ad not found.")
+                return False
+            
+            groups = get_user_groups(user_id)
+            if not groups:
+                await context.bot.send_message(user_id, "❌ No groups found. Please add groups first.")
+                return False
+            
+            # Set ad as broadcasting
+            set_ad_broadcasting(ad_id, True)
+            
+            # Start broadcasting task
+            task = asyncio.create_task(self._broadcast_loop(user_id, ad_id, context))
+            self.broadcasting_tasks[ad_id] = task
+            
+            await context.bot.send_message(
+                user_id,
+                f"🚀 Started broadcasting Ad #{ad_id} to {len(groups)} groups\n"
+                f"📊 Interval: {BROADCAST_INTERVAL} seconds\n"
+                f"🔄 Running infinite cycles..."
             )
             
-            # If we get here, login was successful
-            session_string = client.session.save()
-            add_account(user_id, phone, session_string)
-            await client.disconnect()
-            await cleanup_user_session(user_id)
-
-            await update.message.reply_text(
-                "🎉 Account Added Successfully!\n\n"
-                "✅ Your account has been authenticated.\n"
-                "📊 You can now scan groups and start broadcasting."
-            )
-            await show_dashboard(update, None)
             return True
             
-        except SessionPasswordNeededError:
-            await update.message.reply_text(
-                "🔒 2-Step Verification enabled.\n\n"
-                "Please enter your password:"
-            )
-            user_sessions[user_id]["type"] = "awaiting_password"
-            return False
-            
-        except PhoneCodeInvalidError:
-            remaining_attempts = 5 - session_data["attempts"]
-            if remaining_attempts > 0:
-                await update.message.reply_text(
-                    f"❌ Invalid code. {remaining_attempts} attempts left.\n\n"
-                    f"Please try again:"
-                )
-                return False
-            else:
-                await update.message.reply_text(
-                    "❌ Too many failed attempts. Start over with /start"
-                )
-                await cleanup_user_session(user_id)
-                return False
-                
-        except PhoneCodeExpiredError:
-            await update.message.reply_text(
-                "❌ Code expired! Getting new code...\n\n"
-                "Please wait..."
-            )
-            # Auto-resend
-            success = await resend_otp_code(user_id, update)
-            return False
-            
         except Exception as e:
-            error_msg = str(e).lower()
-            if 'session' in error_msg and 'expired' in error_msg:
-                await update.message.reply_text(
-                    "🔄 Session expired. Getting new code...\n\n"
-                    "Please wait..."
-                )
-                success = await resend_otp_code(user_id, update)
-                return False
-            else:
-                await update.message.reply_text(
-                    f"❌ Verification failed: {str(e)}\n\n"
-                    "Please try 'resend' for a new code."
-                )
-                return False
-
-    except Exception as e:
-        logger.error(f"Error verifying OTP: {e}")
-        await update.message.reply_text(
-            f"❌ Error: {str(e)}\n\n"
-            "Please try 'resend' for a new code."
-        )
-        return False
-
-async def handle_2fa_password(user_id, password, update: Update):
-    """Handle 2FA password"""
-    try:
-        if user_id not in user_sessions:
-            await update.message.reply_text("❌ Session expired. Start over.")
+            logger.error(f"Error starting broadcast: {e}")
+            await context.bot.send_message(user_id, f"❌ Error starting broadcast: {str(e)}")
             return False
-
-        session_data = user_sessions[user_id]
-        client = session_data["client"]
-        phone = session_data["phone"]
-
-        result = await client.sign_in(password=password)
-        
-        session_string = client.session.save()
-        add_account(user_id, phone, session_string)
-        await client.disconnect()
-        await cleanup_user_session(user_id)
-
-        await update.message.reply_text(
-            "🎉 Account Added Successfully!\n\n"
-            "✅ 2-Step Verification completed.\n"
-            "📊 You can now scan groups and start broadcasting."
-        )
-        await show_dashboard(update, None)
-        return True
-
-    except Exception as e:
-        logger.error(f"Error handling 2FA: {e}")
-        await update.message.reply_text(
-            f"❌ 2FA failed: {str(e)}\n\n"
-            "Please check password and try again."
-        )
-        return False
-
-async def cleanup_user_session(user_id):
-    """Clean up user session"""
-    try:
-        if user_id in user_sessions:
-            session_data = user_sessions[user_id]
-            if 'client' in session_data:
-                try:
-                    await session_data['client'].disconnect()
-                except:
-                    pass
-            del user_sessions[user_id]
-    except Exception as e:
-        logger.error(f"Error cleaning up session: {e}")
-
-async def get_groups_from_account(session_string):
-    """Get all groups from an account"""
-    try:
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.start()
-        
-        groups = []
-        async for dialog in client.iter_dialogs():
-            if dialog.is_group or dialog.is_channel:
-                entity = dialog.entity
-                groups.append({
-                    'id': entity.id,
-                    'name': dialog.name,
-                    'username': getattr(entity, 'username', None),
-                    'participants_count': getattr(entity, 'participants_count', 0)
-                })
-        
-        await client.disconnect()
-        return groups
-    except Exception as e:
-        logger.error(f"Error getting groups: {e}")
-        return []
-
-async def send_broadcast_to_groups(session_string, message, user_id):
-    """Send broadcast message to all groups"""
-    try:
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.start()
-        
-        groups_sent = 0
-        async for dialog in client.iter_dialogs():
-            if dialog.is_group or dialog.is_channel:
-                try:
-                    await client.send_message(dialog.entity, message)
-                    groups_sent += 1
-                    await asyncio.sleep(1)  # Reduced delay
-                except Exception as e:
-                    continue
-        
-        await client.disconnect()
-        
-        if groups_sent > 0:
-            update_analytics(user_id, groups_sent, groups_sent)
-        
-        return groups_sent
-    except Exception as e:
-        logger.error(f"Error in broadcast: {e}")
-        return 0
-
-# ===== BROADCAST TASK =====
-async def start_broadcast_task(user_id, interval, message, accounts):
-    """Start broadcasting task"""
-    while user_id in broadcast_tasks and broadcast_tasks[user_id]['running']:
+    
+    async def stop_broadcasting(self, user_id: int, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Stop broadcasting ad"""
         try:
-            total_groups_sent = 0
-            for account in accounts:
-                if not broadcast_tasks[user_id]['running']:
-                    break
-                    
-                session_string = account[3]
-                groups_sent = await send_broadcast_to_groups(session_string, message, user_id)
-                total_groups_sent += groups_sent
+            if ad_id in self.broadcasting_tasks:
+                self.broadcasting_tasks[ad_id].cancel()
+                del self.broadcasting_tasks[ad_id]
             
-            await asyncio.sleep(interval)
+            set_ad_broadcasting(ad_id, False)
+            
+            await context.bot.send_message(user_id, f"🛑 Stopped broadcasting Ad #{ad_id}")
+            return True
             
         except Exception as e:
-            logger.error(f"Error in broadcast task: {e}")
-            await asyncio.sleep(30)
+            logger.error(f"Error stopping broadcast: {e}")
+            await context.bot.send_message(user_id, f"❌ Error stopping broadcast: {str(e)}")
+            return False
+    
+    async def _broadcast_loop(self, user_id: int, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Main broadcasting loop"""
+        user = get_user(user_id)
+        ads = get_user_ads(user_id)
+        ad = next((a for a in ads if a['id'] == ad_id), None)
+        
+        if not user or not ad:
+            return
+        
+        cycle_count = 0
+        
+        while True:
+            try:
+                cycle_count += 1
+                groups = get_user_groups(user_id)
+                
+                await context.bot.send_message(
+                    user_id,
+                    f"🔄 Starting broadcast cycle #{cycle_count}\n"
+                    f"📊 Sending to {len(groups)} groups\n"
+                    f"⏰ Next cycle in {BROADCAST_INTERVAL} seconds"
+                )
+                
+                # Send ad to all groups
+                success_count = 0
+                fail_count = 0
+                
+                for group in groups:
+                    try:
+                        await self._send_ad_to_group(context, ad, group)
+                        success_count += 1
+                        # Small delay between groups to avoid rate limits
+                        await asyncio.sleep(2)
+                        
+                    except Exception as e:
+                        fail_count += 1
+                        logger.error(f"Error sending to group {group['group_id']}: {e}")
+                
+                # Send cycle report
+                await context.bot.send_message(
+                    user_id,
+                    f"📊 Cycle #{cycle_count} Complete:\n"
+                    f"✅ Success: {success_count}\n"
+                    f"❌ Failed: {fail_count}\n"
+                    f"⏳ Next cycle in {BROADCAST_INTERVAL} seconds"
+                )
+                
+                # Wait for next cycle
+                await asyncio.sleep(BROADCAST_INTERVAL)
+                
+            except asyncio.CancelledError:
+                logger.info(f"Broadcasting for ad #{ad_id} cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in broadcast cycle: {e}")
+                await asyncio.sleep(BROADCAST_INTERVAL)
+    
+    async def _send_ad_to_group(self, context: ContextTypes.DEFAULT_TYPE, ad: dict, group: dict):
+        """Send ad to a specific group"""
+        try:
+            group_id = group['group_id']
+            
+            if ad['ad_type'] == 'text':
+                await context.bot.send_message(
+                    chat_id=group_id,
+                    text=ad['message_text'],
+                    parse_mode='HTML'
+                )
+            elif ad['ad_type'] == 'image' and ad['media_file']:
+                file_path = os.path.join(ADS_DIR, ad['media_file'])
+                if os.path.exists(file_path):
+                    with open(file_path, 'rb') as photo:
+                        await context.bot.send_photo(
+                            chat_id=group_id,
+                            photo=photo,
+                            caption=ad['message_text'],
+                            parse_mode='HTML'
+                        )
+                else:
+                    await context.bot.send_message(
+                        chat_id=group_id,
+                        text=ad['message_text'],
+                        parse_mode='HTML'
+                    )
+            elif ad['ad_type'] == 'video' and ad['media_file']:
+                file_path = os.path.join(ADS_DIR, ad['media_file'])
+                if os.path.exists(file_path):
+                    with open(file_path, 'rb') as video:
+                        await context.bot.send_video(
+                            chat_id=group_id,
+                            video=video,
+                            caption=ad['message_text'],
+                            parse_mode='HTML'
+                        )
+                else:
+                    await context.bot.send_message(
+                        chat_id=group_id,
+                        text=ad['message_text'],
+                        parse_mode='HTML'
+                    )
+            
+            logger.info(f"Sent ad to group {group_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send ad to group {group['group_id']}: {e}")
+            raise
 
-# ===== DASHBOARD FUNCTIONS =====
-async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show main dashboard"""
-    user_id = update.effective_user.id
-    create_user(user_id, update.effective_user.username, update.effective_user.first_name, update.effective_user.last_name)
-    
-    settings = get_user_settings(user_id)
-    accounts_count = get_accounts_count(user_id)
-    groups_count = get_groups_count(user_id)
-    messages_sent, groups_reached = get_analytics(user_id)
-    
-    current_time = datetime.now().strftime("%I:%M %p")
-    
-    is_broadcasting = user_id in broadcast_tasks and broadcast_tasks[user_id]['running']
-    has_message = settings and settings[1] and len(settings[1]) > 5
-    
-    dashboard_text = f"""
-🤖 AFTAB PERSONAL AD BOT
+# Initialize broadcaster
+broadcaster = AdBroadcaster()
 
-👥 Accounts: {accounts_count} / 10  
-📢 Message: {'Set ✓' if has_message else 'Not Set'}  
-⏰ Interval: {settings[2] if settings else 120}s  
-📡 Status: {'Running 🔥' if is_broadcasting else 'Stopped 💤'}  
-👥 Groups: {groups_count}
+# ---------------- STATE MANAGEMENT ----------------
+user_states = {}
+ad_temp_data = {}
+user_otp_data = {}
 
-{current_time}
----
-    """.strip()
+# ---------------- BOT APPLICATION SETUP ----------------
+def setup_bot_application():
+    """Setup and return the bot application"""
+    application = Application.builder().token(AD_BOT_TOKEN).build()
     
-    keyboard = [
-        [InlineKeyboardButton("👥 Add Account", callback_data="add_account"),
-         InlineKeyboardButton("🌟 My Accounts", callback_data="my_accounts")],
-        [InlineKeyboardButton("📢 Set Message", callback_data="set_ad_message"),
-         InlineKeyboardButton("⏰ Set Interval", callback_data="set_interval")],
-        [InlineKeyboardButton("🔄 Scan Groups", callback_data="scan_groups"),
-         InlineKeyboardButton("👥 My Groups", callback_data="my_groups")],
-        [InlineKeyboardButton("🚀 Start", callback_data="start_broadcast"),
-         InlineKeyboardButton("💤 Stop", callback_data="stop_broadcast")],
-        [InlineKeyboardButton("📊 Analytics", callback_data="analytics"),
-         InlineKeyboardButton("📞 Contact", url=f"https://t.me/{ADMIN_USERNAME}")],
-        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]
-    ]
+    # Register handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_media_message))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_media_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_caption_message, block=False))
+    application.add_error_handler(error_handler)
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    return application
+
+# Initialize bot application
+bot_application = setup_bot_application()
+
+# ---------------- KEYBOARD GENERATORS ----------------
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📱 Login with Phone", callback_data="start_login")],
+        [InlineKeyboardButton("📊 My Account", callback_data="account_info")],
+        [InlineKeyboardButton("📢 Create Ad", callback_data="create_ad")],
+        [InlineKeyboardButton("📋 My Ads", callback_data="my_ads")],
+        [InlineKeyboardButton("👥 Manage Groups", callback_data="manage_groups")],
+        [InlineKeyboardButton("🚀 Broadcast Control", callback_data="broadcast_control")]
+    ])
+
+def get_ad_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Text Ad", callback_data="ad_type_text")],
+        [InlineKeyboardButton("🖼️ Image + Text", callback_data="ad_type_image")],
+        [InlineKeyboardButton("🎥 Video + Text", callback_data="ad_type_video")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+    ])
+
+def get_ads_management_keyboard(ads: List[dict]) -> InlineKeyboardMarkup:
+    keyboard = []
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(dashboard_text, reply_markup=reply_markup)
+    for ad in ads[:6]:
+        broadcast_status = "🟢" if ad['is_broadcasting'] else "⚪"
+        ad_type_icon = "📝" if ad['ad_type'] == 'text' else "🖼️" if ad['ad_type'] == 'image' else "🎥"
+        keyboard.append([InlineKeyboardButton(
+            f"{broadcast_status} {ad_type_icon} Ad #{ad['id']}", 
+            callback_data=f"manage_ad_{ad['id']}"
+        )])
+    
+    keyboard.extend([
+        [InlineKeyboardButton("📢 Create New Ad", callback_data="create_ad")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_ad_management_keyboard(ad_id: int, is_broadcasting: bool) -> InlineKeyboardMarkup:
+    if is_broadcasting:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛑 Stop Broadcasting", callback_data=f"stop_broadcast_{ad_id}")],
+            [InlineKeyboardButton("📋 Back to Ads", callback_data="my_ads")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
     else:
-        await update.message.reply_text(dashboard_text, reply_markup=reply_markup)
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Start Broadcasting", callback_data=f"start_broadcast_{ad_id}")],
+            [InlineKeyboardButton("📋 Back to Ads", callback_data="my_ads")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
 
-# ===== HANDLERS =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    await update.message.reply_text(
-        "🤖 Welcome to AFTAB PERSONAL AD BOT!\n\n"
-        "✅ Fixed OTP issues\n"
-        "✅ Auto code resend\n"
-        "✅ Better IP handling\n\n"
-        "📞 Support: @azttech"
-    )
-    await show_dashboard(update, context)
+def get_groups_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Group", callback_data="add_group")],
+        [InlineKeyboardButton("📋 My Groups", callback_data="my_groups")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+    ])
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button clicks"""
+# ---------------- MESSAGE GENERATORS ----------------
+async def get_main_menu_message(user_id: int) -> str:
+    user = get_user(user_id)
+    
+    message = "🏠 **Ad Broadcasting Bot**\n\n"
+    
+    if user:
+        message += f"✅ **Logged in as:** {user['phone_number']}\n"
+        
+        ads = get_user_ads(user_id)
+        groups = get_user_groups(user_id)
+        active_broadcasts = len([ad for ad in ads if ad['is_broadcasting']])
+        
+        message += f"📊 **Stats:** {len(ads)} ads, {len(groups)} groups, {active_broadcasts} active broadcasts\n\n"
+    else:
+        message += "❌ **Not logged in**\n\n"
+    
+    message += "**Features:**\n"
+    message += "• 📱 Phone number login (No API required)\n"
+    message += "• 📢 Create text/image/video ads\n"
+    message += "• 👥 Add groups manually\n"
+    message += "• 🚀 Broadcast to all groups\n"
+    message += "• ⏰ 120-second intervals\n"
+    message += "• 🔄 Infinite cycles\n\n"
+    
+    message += "Select an option:"
+    
+    return message
+
+# ---------------- COMMAND HANDLERS ----------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    
+    text = await get_main_menu_message(user_id)
+    keyboard = get_main_menu_keyboard()
+    
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+🤖 **Ad Broadcasting Bot Help**
+
+**Simple Login:**
+1. 📱 Enter your phone number
+2. 🔢 Receive OTP code
+3. ✅ Enter OTP to verify
+4. 🚀 Start broadcasting!
+
+**Features:**
+• Works in ALL countries
+• No Telegram API required
+• Simple phone verification
+• Manual group management
+• 120-second broadcast intervals
+• Infinite cycles
+
+**Commands:**
+/start - Main menu
+/help - This message
+/cancel - Cancel current operation
+"""
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id in user_states:
+        del user_states[user_id]
+    if user_id in ad_temp_data:
+        del ad_temp_data[user_id]
+    if user_id in user_otp_data:
+        del user_otp_data[user_id]
+    
+    await update.message.reply_text("❌ Operation cancelled.")
+    
+    text = await get_main_menu_message(user_id)
+    keyboard = get_main_menu_keyboard()
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+# ---------------- CALLBACK QUERY HANDLER ----------------
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
     data = query.data
     
-    if data == "refresh":
-        await show_dashboard(update, context)
-    
-    elif data == "add_account":
-        accounts_count = get_accounts_count(user_id)
-        if accounts_count >= 10:
-            await query.edit_message_text(
-                "❌ Max 10 accounts reached!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="refresh")]])
-            )
-            return
+    try:
+        if data == "main_menu":
+            await show_main_menu(query)
+        elif data == "account_info":
+            await show_account_info(query)
+        elif data == "create_ad":
+            await start_create_ad(query)
+        elif data == "my_ads":
+            await show_my_ads(query)
+        elif data == "manage_groups":
+            await show_manage_groups(query)
+        elif data == "broadcast_control":
+            await show_broadcast_control(query)
+        elif data == "start_login":
+            await start_login_process(query)
+        
+        # Ad creation
+        elif data.startswith("ad_type_"):
+            ad_type = data[8:]
+            await handle_ad_type_selection(query, ad_type)
+        elif data.startswith("manage_ad_"):
+            ad_id = int(data[10:])
+            await manage_ad(query, ad_id)
+        elif data.startswith("start_broadcast_"):
+            ad_id = int(data[16:])
+            await start_broadcast_ad(query, ad_id, context)
+        elif data.startswith("stop_broadcast_"):
+            ad_id = int(data[15:])
+            await stop_broadcast_ad(query, ad_id, context)
+        
+        # Group management
+        elif data == "add_group":
+            await start_add_group(query)
+        elif data == "my_groups":
+            await show_my_groups(query)
             
-        await query.edit_message_text(
-            "👥 Add Account\n\n"
-            "📱 Send phone number:\n\n"
-            "Format: +1234567890\n\n"
-            "💡 Use active accounts for best results"
-        )
-        user_sessions[user_id] = "awaiting_phone"
-    
-    elif data == "my_accounts":
-        accounts = get_user_accounts(user_id)
-        if accounts:
-            accounts_text = "🌟 My Accounts\n\n"
-            for account in accounts:
-                accounts_text += f"📱 {account[2]}\n"
-            accounts_text += f"\nTotal: {len(accounts)}/10"
-        else:
-            accounts_text = "❌ No accounts yet"
-        
-        await query.edit_message_text(
-            accounts_text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="refresh")]])
-        )
-    
-    elif data == "set_ad_message":
-        settings = get_user_settings(user_id)
-        current_message = settings[1] if settings else "Not set"
-        await query.edit_message_text(
-            f"📢 Current: {current_message}\n\n"
-            f"Send new message:"
-        )
-        user_sessions[user_id] = "awaiting_message"
-    
-    elif data == "set_interval":
-        await query.edit_message_text(
-            "⏰ Set Interval:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("1 min", callback_data="interval_60"),
-                 InlineKeyboardButton("2 min", callback_data="interval_120")],
-                [InlineKeyboardButton("5 min", callback_data="interval_300"),
-                 InlineKeyboardButton("10 min", callback_data="interval_600")],
-                [InlineKeyboardButton("🔙 Back", callback_data="refresh")]
-            ])
-        )
-    
-    elif data == "scan_groups":
-        accounts = get_user_accounts(user_id)
-        if not accounts:
-            await query.edit_message_text("❌ No accounts found!")
-            return
-        
-        await query.edit_message_text("🔄 Scanning groups...")
-        
-        total_groups = 0
-        for account in accounts:
-            groups = await get_groups_from_account(account[3])
-            for group in groups:
-                add_group(user_id, account[0], group['name'], group['username'], group['id'], group['participants_count'])
-            total_groups += len(groups)
-        
-        await query.edit_message_text(
-            f"✅ Found {total_groups} groups",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="refresh")]])
-        )
-    
-    elif data == "my_groups":
-        groups = get_user_groups(user_id)
-        if groups:
-            groups_text = "👥 My Groups\n\n"
-            for group in groups[:5]:
-                group_name = group[3] or "No Name"
-                members = group[6] or 0
-                groups_text += f"• {group_name} ({members})\n"
-            groups_text += f"\nTotal: {len(groups)} groups"
-        else:
-            groups_text = "❌ No groups found"
-        
-        await query.edit_message_text(
-            groups_text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="refresh")]])
-        )
-    
-    elif data == "start_broadcast":
-        accounts = get_user_accounts(user_id)
-        settings = get_user_settings(user_id)
-        
-        if not accounts:
-            await query.edit_message_text("❌ No accounts found!")
-            return
-        
-        if not settings or not settings[1]:
-            await query.edit_message_text("❌ No message set!")
-            return
-        
-        if user_id not in broadcast_tasks:
-            broadcast_tasks[user_id] = {
-                'running': True,
-                'task': asyncio.create_task(
-                    start_broadcast_task(user_id, settings[2], settings[1], accounts)
-                )
-            }
-        
-        update_broadcast_status(user_id, 1)
-        
-        await query.edit_message_text(
-            f"🚀 Started!\n\n"
-            f"Accounts: {len(accounts)}\n"
-            f"Interval: {settings[2]}s",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="refresh")]])
-        )
-    
-    elif data == "stop_broadcast":
-        if user_id in broadcast_tasks:
-            broadcast_tasks[user_id]['running'] = False
-            del broadcast_tasks[user_id]
-        
-        update_broadcast_status(user_id, 0)
-        
-        await query.edit_message_text(
-            "💤 Stopped!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="refresh")]])
-        )
-    
-    elif data == "analytics":
-        messages_sent, groups_reached = get_analytics(user_id)
-        success_rate = ((groups_reached/messages_sent)*100) if messages_sent > 0 else 0
-        
-        await query.edit_message_text(
-            f"📊 Analytics\n\n"
-            f"Messages: {messages_sent}\n"
-            f"Groups: {groups_reached}\n"
-            f"Success: {success_rate:.1f}%",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="refresh")]])
-        )
-    
-    elif data.startswith("interval_"):
-        interval = int(data.split("_")[1])
-        update_interval(user_id, interval)
-        await query.edit_message_text(
-            f"✅ Interval: {interval}s",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="refresh")]])
-        )
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
+        try:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+        except Exception:
+            pass
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle regular messages"""
-    user_id = update.effective_user.id
-    message_text = update.message.text.strip() if update.message.text else ""
+# ---------------- UI HANDLERS ----------------
+async def show_main_menu(query):
+    user_id = query.from_user.id
+    text = await get_main_menu_message(user_id)
+    keyboard = get_main_menu_keyboard()
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def show_account_info(query):
+    user_id = query.from_user.id
+    user = get_user(user_id)
     
-    if user_id in user_sessions:
-        session_type = user_sessions[user_id]
+    if not user:
+        text = "❌ You are not logged in. Please login first."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 Login", callback_data="start_login")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+    
+    ads = get_user_ads(user_id)
+    groups = get_user_groups(user_id)
+    active_broadcasts = len([ad for ad in ads if ad['is_broadcasting']])
+    
+    message = "📊 **Account Information**\n\n"
+    message += f"📱 **Phone:** {user['phone_number']}\n"
+    message += f"🆔 **User ID:** {user['user_id']}\n"
+    message += f"📅 **Registered:** {user['created_at'][:16]}\n"
+    message += f"🔐 **Last Login:** {user['last_login'][:16] if user['last_login'] else 'N/A'}\n\n"
+    
+    message += "📈 **Statistics:**\n"
+    message += f"• **Total Ads:** {len(ads)}\n"
+    message += f"• **Active Broadcasts:** {active_broadcasts}\n"
+    message += f"• **Groups:** {len(groups)}\n"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+    ])
+    
+    await query.edit_message_text(message, reply_markup=keyboard, parse_mode="Markdown")
+
+async def start_login_process(query):
+    user_id = query.from_user.id
+    user_states[user_id] = "waiting_phone"
+    
+    text = "📱 **Phone Login**\n\n"
+    text += "Please send your phone number in international format:\n"
+    text += "Example: `+1234567890` or `1234567890`\n\n"
+    text += "We'll send you an OTP code to verify your number.\n\n"
+    text += "Send /cancel to cancel login."
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def start_create_ad(query):
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    
+    if not user:
+        text = "❌ You need to login first to create ads."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 Login", callback_data="start_login")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+    
+    text = "📢 **Create New Ad**\n\n"
+    text += "Select the type of ad you want to create:\n\n"
+    text += "• 📝 **Text Ad** - Simple text message\n"
+    text += "• 🖼️ **Image Ad** - Image with caption\n"
+    text += "• 🎥 **Video Ad** - Video with description\n"
+    
+    keyboard = get_ad_type_keyboard()
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def handle_ad_type_selection(query, ad_type: str):
+    user_id = query.from_user.id
+    user_states[user_id] = f"waiting_ad_{ad_type}"
+    ad_temp_data[user_id] = {'type': ad_type}
+    
+    if ad_type == 'text':
+        text = "📝 **Create Text Ad**\n\n"
+        text += "Please send the text message for your ad.\n\n"
+        text += "**Tips:**\n"
+        text += "• Use HTML formatting: <b>bold</b>, <i>italic</i>\n"
+        text += "• Keep it engaging and clear\n"
+        text += "• Include a call-to-action\n\n"
+        text += "Send /cancel to cancel ad creation."
+    else:
+        media_type = "image" if ad_type == 'image' else "video"
+        text = f"🖼️ **Create {media_type.capitalize()} Ad**\n\n"
+        text += f"Please send the {media_type} for your ad first.\n\n"
+        text += "Send /cancel to cancel ad creation."
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="create_ad")]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def show_my_ads(query):
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    
+    if not user:
+        text = "❌ You need to login first to view your ads."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 Login", callback_data="start_login")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+    
+    ads = get_user_ads(user_id)
+    
+    if not ads:
+        text = "📋 **My Ads**\n\n"
+        text += "You haven't created any ads yet.\n\n"
+        text += "Create your first ad to start broadcasting!"
         
-        if session_type == "awaiting_message":
-            update_ad_message(user_id, message_text)
-            await update.message.reply_text("✅ Message saved!")
-            del user_sessions[user_id]
-            await show_dashboard(update, context)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Create Ad", callback_data="create_ad")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+    else:
+        active_count = len([ad for ad in ads if ad['is_broadcasting']])
+        text = f"📋 **My Ads**\n\n"
+        text += f"Found **{len(ads)}** ads ({active_count} active broadcasts)\n\n"
+        text += "Click on an ad to manage broadcasting:"
         
-        elif session_type == "awaiting_phone":
-            if message_text.lower() == 'cancel':
-                await cleanup_user_session(user_id)
-                await update.message.reply_text("❌ Cancelled.")
-                await show_dashboard(update, context)
+        keyboard = get_ads_management_keyboard(ads)
+    
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def manage_ad(query, ad_id: int):
+    user_id = query.from_user.id
+    ads = get_user_ads(user_id)
+    ad = next((a for a in ads if a['id'] == ad_id), None)
+    
+    if not ad:
+        await query.edit_message_text("❌ Ad not found.")
+        return
+    
+    ad_type_icon = "📝" if ad['ad_type'] == 'text' else "🖼️" if ad['ad_type'] == 'image' else "🎥"
+    broadcast_status = "🟢 BROADCASTING" if ad['is_broadcasting'] else "⚪ STOPPED"
+    
+    text = f"{ad_type_icon} **Ad Management**\n\n"
+    text += f"**ID:** #{ad['id']}\n"
+    text += f"**Type:** {ad['ad_type'].capitalize()}\n"
+    text += f"**Status:** {broadcast_status}\n"
+    text += f"**Created:** {ad['created_at'][:16]}\n\n"
+    
+    if ad['message_text']:
+        message_preview = ad['message_text'][:100] + "..." if len(ad['message_text']) > 100 else ad['message_text']
+        text += f"**Message Preview:**\n{message_preview}\n\n"
+    
+    if ad['is_broadcasting']:
+        text += "🔄 This ad is currently being broadcast to all your groups every 120 seconds.\n\n"
+        text += "Click below to stop broadcasting:"
+    else:
+        text += "⏸️ This ad is not currently broadcasting.\n\n"
+        text += "Click below to start broadcasting to all your groups:"
+    
+    keyboard = get_ad_management_keyboard(ad_id, ad['is_broadcasting'])
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def start_broadcast_ad(query, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+    user_id = query.from_user.id
+    success = await broadcaster.start_broadcasting(user_id, ad_id, context)
+    if success:
+        await manage_ad(query, ad_id)
+
+async def stop_broadcast_ad(query, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+    user_id = query.from_user.id
+    success = await broadcaster.stop_broadcasting(user_id, ad_id, context)
+    if success:
+        await manage_ad(query, ad_id)
+
+async def show_manage_groups(query):
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    
+    if not user:
+        text = "❌ You need to login first to manage groups."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 Login", callback_data="start_login")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+    
+    text = "👥 **Group Management**\n\n"
+    text += "Here you can manage the groups where your ads will be broadcast.\n\n"
+    text += "**Options:**\n"
+    text += "• ➕ Add Group - Add a new group by ID\n"
+    text += "• 📋 My Groups - View your current groups\n\n"
+    text += "Your ads will be sent to all active groups."
+    
+    keyboard = get_groups_keyboard()
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def start_add_group(query):
+    user_id = query.from_user.id
+    user_states[user_id] = "waiting_group_id"
+    
+    text = "➕ **Add Group**\n\n"
+    text += "Please send the group ID where you want to broadcast ads.\n\n"
+    text += "**How to get Group ID:**\n"
+    text += "1. Add this bot to your group\n"
+    text += "2. Send any message in the group\n"
+    text += "3. Forward that message to @userinfobot\n"
+    text += "4. Copy the Chat ID (a negative number)\n\n"
+    text += "Send the Group ID now:\n\n"
+    text += "Send /cancel to cancel."
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="manage_groups")]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def show_my_groups(query):
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    
+    if not user:
+        text = "❌ You need to login first to view groups."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 Login", callback_data="start_login")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+    
+    groups = get_user_groups(user_id)
+    
+    if not groups:
+        text = "👥 **My Groups**\n\n"
+        text += "No groups found.\n\n"
+        text += "Click below to add your first group:"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+    else:
+        text = f"👥 **My Groups**\n\n"
+        text += f"Found **{len(groups)}** groups\n\n"
+        
+        for i, group in enumerate(groups):
+            text += f"{i+1}. {group['group_title']} (ID: {group['group_id']})\n"
+        
+        text += "\nThese groups will receive your broadcast ads."
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add More Groups", callback_data="add_group")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+    
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def show_broadcast_control(query):
+    user_id = query.from_user.id
+    user = get_user(user_id)
+    
+    if not user:
+        text = "❌ You need to login first."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📱 Login", callback_data="start_login")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+    
+    active_ads = [ad for ad in get_user_ads(user_id) if ad['is_broadcasting']]
+    groups = get_user_groups(user_id)
+    
+    text = "🚀 **Broadcast Control Center**\n\n"
+    text += f"**Active Broadcasts:** {len(active_ads)}\n"
+    text += f"**Target Groups:** {len(groups)}\n"
+    text += f"**Broadcast Interval:** {BROADCAST_INTERVAL} seconds\n\n"
+    
+    if active_ads:
+        text += "**Currently Broadcasting:**\n"
+        for ad in active_ads[:3]:
+            ad_type_icon = "📝" if ad['ad_type'] == 'text' else "🖼️" if ad['ad_type'] == 'image' else "🎥"
+            text += f"• {ad_type_icon} Ad #{ad['id']}\n"
+        
+        if len(active_ads) > 3:
+            text += f"• ... and {len(active_ads) - 3} more\n"
+    else:
+        text += "No active broadcasts running.\n"
+    
+    text += "\nManage your broadcasts from the ads menu:"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Manage Ads", callback_data="my_ads")],
+        [InlineKeyboardButton("👥 Manage Groups", callback_data="manage_groups")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+# ---------------- MESSAGE HANDLERS ----------------
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    text_content = update.message.text
+
+    if user_id in user_states and user_states[user_id].startswith("waiting_"):
+        state = user_states[user_id]
+        
+        if state == "waiting_phone":
+            # Validate phone number
+            phone_number = text_content.strip()
+            if not phone_number:
+                await update.message.reply_text("❌ Please enter a valid phone number.")
                 return
+            
+            # Generate OTP
+            otp_code = generate_otp()
+            save_otp(phone_number, otp_code)
+            
+            # Store phone number for verification
+            user_otp_data[user_id] = {
+                'phone': phone_number,
+                'otp': otp_code
+            }
+            
+            user_states[user_id] = "waiting_otp"
+            
+            await update.message.reply_text(
+                f"📱 **OTP Sent**\n\n"
+                f"Phone: `{phone_number}`\n"
+                f"OTP Code: `{otp_code}`\n\n"
+                f"**This is a demo - in real app, OTP would be sent via SMS**\n\n"
+                f"Please enter the OTP code to verify:\n\n"
+                f"Send /cancel to cancel."
+            )
+        
+        elif state == "waiting_otp":
+            if user_id not in user_otp_data:
+                await update.message.reply_text("❌ OTP session expired. Please start over.")
+                del user_states[user_id]
+                return
+            
+            phone_data = user_otp_data[user_id]
+            entered_otp = text_content.strip()
+            
+            # Verify OTP
+            if verify_otp(phone_data['phone'], entered_otp):
+                # OTP verified - create/update user
+                add_user(user_id, phone_data['phone'])
                 
-            if re.match(r'^\+\d{10,15}$', message_text):
-                if get_accounts_count(user_id) < 10:
-                    await send_otp_code(message_text, user_id, update)
-                else:
-                    await update.message.reply_text("❌ Account limit reached!")
-                    await show_dashboard(update, context)
+                del user_states[user_id]
+                del user_otp_data[user_id]
+                
+                await update.message.reply_text(
+                    f"✅ **Login Successful!**\n\n"
+                    f"Welcome! You are now logged in with:\n"
+                    f"📱 Phone: `{phone_data['phone']}`\n\n"
+                    f"You can now create ads and start broadcasting.",
+                    parse_mode="Markdown"
+                )
+                
+                text = await get_main_menu_message(user_id)
+                keyboard = get_main_menu_keyboard()
+                await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
             else:
-                await update.message.reply_text("❌ Use format: +1234567890")
+                await update.message.reply_text(
+                    "❌ Invalid OTP code. Please try again or send /cancel to start over."
+                )
         
-        elif isinstance(session_type, dict) and session_type.get("type") == "awaiting_code":
-            if message_text.lower() == 'cancel':
-                await cleanup_user_session(user_id)
-                await update.message.reply_text("❌ Cancelled.")
-                await show_dashboard(update, context)
+        elif state == "waiting_group_id":
+            group_id = text_content.strip()
+            
+            if not group_id:
+                await update.message.reply_text("❌ Please enter a valid group ID.")
                 return
-                
-            if message_text.lower() == 'resend':
-                await update.message.reply_text("🔄 Getting new code...")
-                await resend_otp_code(user_id, update)
-                return
-                
-            if re.match(r'^\d{5,6}$', message_text):  # Allow 5-6 digit codes
-                await verify_otp_code(user_id, message_text, update)
-            else:
-                await update.message.reply_text("❌ Enter 5-digit code or 'resend'")
+            
+            # Save group with a generic title
+            save_group(user_id, group_id, f"Group {group_id}")
+            
+            del user_states[user_id]
+            
+            await update.message.reply_text(
+                f"✅ **Group Added Successfully!**\n\n"
+                f"Group ID: `{group_id}`\n\n"
+                f"This group will now receive your broadcast ads.",
+                parse_mode="Markdown"
+            )
+            
+            await show_manage_groups_from_message(update)
         
-        elif isinstance(session_type, dict) and session_type.get("type") == "awaiting_password":
-            if message_text.lower() == 'cancel':
-                await cleanup_user_session(user_id)
-                await update.message.reply_text("❌ Cancelled.")
-                await show_dashboard(update, context)
-                return
-                
-            await handle_2fa_password(user_id, message_text, update)
+        elif state == "waiting_ad_text":
+            ad_id = save_ad(user_id, 'text', text_content)
+            del user_states[user_id]
+            
+            await update.message.reply_text(
+                f"✅ **Text Ad Created!**\n\n"
+                f"**Ad ID:** #{ad_id}\n\n"
+                f"You can now start broadcasting this ad to all your groups.",
+                parse_mode="Markdown"
+            )
+            
+            text = await get_main_menu_message(user_id)
+            keyboard = get_main_menu_keyboard()
+            await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
     
     else:
-        await show_dashboard(update, context)
+        await update.message.reply_text(
+            "Send /start to see the main menu or /help for assistance."
+        )
 
-# ===== MAIN FUNCTION =====
-def main():
-    """Start the bot"""
-    # Initialize database
-    init_database()
+async def show_manage_groups_from_message(update: Update):
+    """Show groups menu from message handler"""
+    user_id = update.effective_user.id
+    groups = get_user_groups(user_id)
+    
+    if not groups:
+        text = "👥 **My Groups**\n\nNo groups found."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Group", callback_data="add_group")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ])
+    else:
+        text = f"👥 **My Groups**\n\nFound **{len(groups)}** groups"
+        keyboard = get_groups_keyboard()
+    
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+
+    if user_id not in user_states or not user_states[user_id].startswith("waiting_ad_"):
+        return
+
+    state = user_states[user_id]
+    ad_type = state[11:]
+    
+    if ad_type not in ['image', 'video']:
+        return
+
+    if update.message.photo:
+        file = await update.message.photo[-1].get_file()
+        file_ext = '.jpg'
+    elif update.message.video:
+        file = await update.message.video.get_file()
+        file_ext = '.mp4'
+    else:
+        return
+
+    timestamp = int(time.time())
+    filename = f"ad_{user_id}_{timestamp}{file_ext}"
+    file_path = os.path.join(ADS_DIR, filename)
+    
+    await file.download_to_drive(file_path)
+    
+    ad_temp_data[user_id] = {
+        'type': ad_type,
+        'media_file': filename,
+        'file_path': file_path
+    }
+    user_states[user_id] = f"waiting_ad_{ad_type}_caption"
+    
+    await update.message.reply_text(
+        f"✅ {ad_type.capitalize()} received!\n\n"
+        f"Now please send the caption/text for your {ad_type} ad:\n\n"
+        f"Send /cancel to cancel ad creation."
+    )
+
+async def handle_caption_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    caption = update.message.text
+
+    if user_id not in user_states or not user_states[user_id].endswith("_caption"):
+        return
+
+    state = user_states[user_id]
+    ad_type = state[11:-8]
+    
+    if user_id not in ad_temp_data:
+        await update.message.reply_text("❌ Error: Media data lost. Please start over.")
+        del user_states[user_id]
+        return
+
+    media_data = ad_temp_data[user_id]
+    ad_id = save_ad(user_id, ad_type, caption, media_data['media_file'])
+    
+    del user_states[user_id]
+    del ad_temp_data[user_id]
+    
+    await update.message.reply_text(
+        f"✅ **{ad_type.capitalize()} Ad Created!**\n\n"
+        f"**Ad ID:** #{ad_id}\n"
+        f"**Type:** {ad_type.capitalize()}\n\n"
+        f"You can now start broadcasting this ad to all your groups.",
+        parse_mode="Markdown"
+    )
+    
+    text = await get_main_menu_message(user_id)
+    keyboard = get_main_menu_keyboard()
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
+# ---------------- ERROR HANDLER ----------------
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        raise context.error
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        try:
+            if update and getattr(update, "effective_message", None):
+                await update.effective_message.reply_text("❌ An error occurred. Please try again.")
+        except Exception:
+            pass
+
+# ---------------- BOT POLLING FUNCTION ----------------
+async def run_bot_polling():
+    """Run bot in polling mode"""
+    print("🤖 Starting Ad Broadcasting Bot...")
+    print(f"📁 Data Directory: {BASE_DIR}")
+    print(f"💾 Database: {DB_PATH}")
+    print(f"⏰ Broadcast Interval: {BROADCAST_INTERVAL} seconds")
+    print("🔐 Authentication: Phone Number + OTP (No API required)")
+    print("🌍 Works in ALL countries")
+    print("🚀 Bot is running in polling mode...")
     
     try:
-        # Create application with error handling
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        # Add handlers
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CallbackQueryHandler(button_handler))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        
-        print("🤖 AFTAB BOT - COMPATIBLE VERSION")
-        print("✅ Fixed version compatibility")
-        print("✅ Working with latest python-telegram-bot")
-        print("✅ Ready for Render deployment")
-        print("🚀 Starting bot...")
-        
-        # Start polling
-        application.run_polling(
+        await bot_application.initialize()
+        await bot_application.start()
+        await bot_application.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
-            timeout=30,
-            pool_timeout=30
+            drop_pending_updates=True
         )
         
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(3600)  # Sleep for 1 hour
+            
     except Exception as e:
-        print(f"❌ Error starting bot: {e}")
-        print("Please check your BOT_TOKEN and try again.")
+        logger.error(f"Bot polling error: {e}")
+    finally:
+        await bot_application.stop()
 
+# ---------------- MAIN FUNCTION ----------------
+async def main():
+    """Main function to run both Flask and bot"""
+    print("🚀 Starting Ad Broadcasting Bot on Render...")
+    
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("🌐 Flask server started on port 10000")
+    
+    # Run bot polling
+    await run_bot_polling()
+
+# Run both Flask + bot
 if __name__ == "__main__":
-    main()
+    # Start the application
+    asyncio.run(main())
