@@ -2,7 +2,6 @@
 """
 Ad Broadcasting Bot - Render Compatible Version
 Phone Number + OTP Authentication
-Python 3.12.1 Compatible
 """
 
 import os
@@ -18,11 +17,13 @@ from typing import Optional, Dict, List
 import logging
 from flask import Flask, request
 
-# Telegram imports
+# Telegram imports - using compatible approach
+import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes, CallbackQueryHandler
+    filters, CallbackQueryHandler,
+    CallbackContext
 )
 
 # ---------------- CONFIG ----------------
@@ -299,7 +300,7 @@ class AdBroadcaster:
     def __init__(self):
         self.broadcasting_tasks = {}
     
-    async def start_broadcasting(self, user_id: int, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+    async def start_broadcasting(self, user_id: int, ad_id: int, context: CallbackContext):
         """Start broadcasting ad to all groups"""
         try:
             user = get_user(user_id)
@@ -339,7 +340,7 @@ class AdBroadcaster:
             await context.bot.send_message(user_id, f"❌ Error starting broadcast: {str(e)}")
             return False
     
-    async def stop_broadcasting(self, user_id: int, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+    async def stop_broadcasting(self, user_id: int, ad_id: int, context: CallbackContext):
         """Stop broadcasting ad"""
         try:
             if ad_id in self.broadcasting_tasks:
@@ -356,7 +357,7 @@ class AdBroadcaster:
             await context.bot.send_message(user_id, f"❌ Error stopping broadcast: {str(e)}")
             return False
     
-    async def _broadcast_loop(self, user_id: int, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+    async def _broadcast_loop(self, user_id: int, ad_id: int, context: CallbackContext):
         """Main broadcasting loop"""
         user = get_user(user_id)
         ads = get_user_ads(user_id)
@@ -413,7 +414,7 @@ class AdBroadcaster:
                 logger.error(f"Error in broadcast cycle: {e}")
                 await asyncio.sleep(BROADCAST_INTERVAL)
     
-    async def _send_ad_to_group(self, context: ContextTypes.DEFAULT_TYPE, ad: dict, group: dict):
+    async def _send_ad_to_group(self, context: CallbackContext, ad: dict, group: dict):
         """Send ad to a specific group"""
         try:
             group_id = group['group_id']
@@ -559,7 +560,7 @@ async def get_main_menu_message(user_id: int) -> str:
     return message
 
 # ---------------- COMMAND HANDLERS ----------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
     user_id = user.id
     
@@ -568,7 +569,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update: Update, context: CallbackContext):
     help_text = """
 🤖 **Ad Broadcasting Bot Help**
 
@@ -593,7 +594,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_command(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     
     if user_id in user_states:
@@ -610,7 +611,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 # ---------------- CALLBACK QUERY HANDLER ----------------
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback_query(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
     
@@ -830,13 +831,13 @@ async def manage_ad(query, ad_id: int):
     keyboard = get_ad_management_keyboard(ad_id, ad['is_broadcasting'])
     await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
-async def start_broadcast_ad(query, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def start_broadcast_ad(query, ad_id: int, context: CallbackContext):
     user_id = query.from_user.id
     success = await broadcaster.start_broadcasting(user_id, ad_id, context)
     if success:
         await manage_ad(query, ad_id)
 
-async def stop_broadcast_ad(query, ad_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def stop_broadcast_ad(query, ad_id: int, context: CallbackContext):
     user_id = query.from_user.id
     success = await broadcaster.stop_broadcasting(user_id, ad_id, context)
     if success:
@@ -968,7 +969,7 @@ async def show_broadcast_control(query):
     await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 # ---------------- MESSAGE HANDLERS ----------------
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text_message(update: Update, context: CallbackContext):
     user = update.effective_user
     user_id = user.id
     text_content = update.message.text
@@ -1095,7 +1096,7 @@ async def show_manage_groups_from_message(update: Update):
     
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
-async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_media_message(update: Update, context: CallbackContext):
     user = update.effective_user
     user_id = user.id
 
@@ -1136,7 +1137,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Send /cancel to cancel ad creation."
     )
 
-async def handle_caption_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_caption_message(update: Update, context: CallbackContext):
     user = update.effective_user
     user_id = user.id
     caption = update.message.text
@@ -1171,22 +1172,16 @@ async def handle_caption_message(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
 # ---------------- ERROR HANDLER ----------------
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors in the bot"""
+async def error_handler(update: Update, context: CallbackContext):
     try:
-        if context.error:
-            logger.error(f"Error: {context.error}", exc_info=True)
-        else:
-            logger.error("Unknown error occurred", exc_info=True)
-            
-        # Try to notify the user
-        try:
-            if update and hasattr(update, 'effective_message') and update.effective_message:
-                await update.effective_message.reply_text("❌ An error occurred. Please try again.")
-        except Exception as e:
-            logger.error(f"Failed to send error message to user: {e}")
+        raise context.error
     except Exception as e:
-        logger.error(f"Exception in error handler: {e}", exc_info=True)
+        logger.error(f"Error: {e}")
+        try:
+            if update and getattr(update, "effective_message", None):
+                await update.effective_message.reply_text("❌ An error occurred. Please try again.")
+        except Exception:
+            pass
 
 # ---------------- BOT SETUP AND POLLING ----------------
 async def run_bot():
@@ -1198,30 +1193,31 @@ async def run_bot():
     print("🔐 Authentication: Phone Number + OTP (No API required)")
     print("🌍 Works in ALL countries")
     
-    # Create application
-    application = Application.builder().token(AD_BOT_TOKEN).build()
+    # Create application with specific configuration
+    application = (
+        Application.builder()
+        .token(AD_BOT_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
     
     # Register handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
-    
-    # Message handlers - order matters!
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_media_message))
     application.add_handler(MessageHandler(filters.VIDEO, handle_media_message))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_caption_message))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_caption_message, block=False))
     application.add_error_handler(error_handler)
     
     print("🚀 Bot is starting polling...")
     
-    # Start polling with proper configuration for newer versions
+    # Start polling
     await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        close_loop=False
+        drop_pending_updates=True
     )
 
 # ---------------- MAIN EXECUTION ----------------
